@@ -6,16 +6,22 @@ import (
 	"encoding/hex"
 	"flag"
 	_ "fmt"
+	"github.com/mediocregopher/radix.v2/pool"
+	// "github.com/mediocregopher/radix.v2/redis"
 	"github.com/mgutz/str"
 	"github.com/sirupsen/logrus"
 	"io"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const HANDLE_DIG = " /dig?"
+const HANDLE_MOVIE = "/movie/"
+const HANDLE_LIST = "/list/"
+const HANDLE_HTML = ".html"
 
 type cmdParams struct {
 	logFilePath string
@@ -30,19 +36,33 @@ type digData struct {
 }
 
 type urlData struct {
-	data digData
-	uid  string
+	data  digData
+	uid   string
+	unode urlNode
 }
 
 type urlNode struct {
+	unType string // /movie/ 或者是 /list/ 首页 或者列表页
+	unRid  int    // Resource Id 资源ID
+	unUrl  string // 当前这个页面的url
+	unTime string //当前访问这个页面的时间
 }
 
 var log = logrus.New()
+
+//redis这种最好设置全局 在并发模型中会出问题 所以建议使用连接池
+// var redisCli redis.Client
 
 //在golang项目里面 自动回先执行init初始化函数
 func init() {
 	log.Out = os.Stdout
 	log.SetLevel(logrus.DebugLevel)
+	// redisCli, err := redis.Dial("tcp", "localhost:6379")
+	// if err != nil {
+	// 	log.Fatalln("Redis connect failed")
+	// } else {
+	// 	defer redisCli.Close()
+	// }
 }
 
 type storageBlock struct {
@@ -78,6 +98,21 @@ func main() {
 	var uvChannel = make(chan urlData, params.routineNum)
 	var storageChannel = make(chan storageBlock, params.routineNum)
 
+	// Redis连接池
+	redisPool, err := pool.New("tcp", "localhost:6379", 2*params.routineNum)
+	if err != nil {
+		log.Fatalln("Redis pool created failed.")
+		panic(err)
+	} else {
+		//连接成功后 在空闲时候没有什么日志产生的时候也一直ping redis server 保持持久
+		go func() {
+			for {
+				redisPool.Cmd("PING")
+				time.Sleep(3 * time.Second)
+			}
+		}()
+	}
+
 	//日志消费者
 	go readFileLinebyLine(params, logChannel)
 
@@ -88,24 +123,79 @@ func main() {
 
 	//创建pv uv 统计器 统计需求 可扩展的xxxCounter需求 用于新增统计分析需求
 	go pvCounter(pvChannel, storageChannel)
-	go uvCounter(uvChannel, storageChannel)
+	go uvCounter(uvChannel, storageChannel, redisPool)
 
 	//创建存储器
-	go dataStorage(storageChannel)
+	go dataStorage(storageChannel, redisPool)
 
 	time.Sleep(1000 * time.Second) //用于开发调试 防止提前退出主程序
 }
 
-func dataStorage(storageChannel chan storageBlock) {
+// 对于大企业级存储使用的一般是HBase 劣势:列簇需要声明清楚(因为业务也已经固定) 对于小企业变化 使用redis也可以cover
+func dataStorage(storageChannel chan storageBlock, redisPool *pool.Pool) {
+	for block := range storageChannel {
+		prefix := block.counterType + "_"
 
+		// 逐层添加,加洋葱皮的过程 访问了子页面 父类页面的pv也要加1 例如访问了
+		// http://localhost:8888/movie/12917.html 则对于http://localhost:8888/movie/上一层也要加pv 1 次
+		// 即是对于访问的上一个分类访问pv都要加1
+		// 区分维度: 天-小时-分钟
+		// 层级:顶级-大分类-小分类-终极页面
+		// 存储模型: Redis SortedSet 有序集合
+		setKeys := []string{
+			prefix + "day_" + getTime(block.unode.unTime, "day"),
+			prefix + "hour_" + getTime(block.unode.unTime, "hour"),
+			prefix + "min_" + getTime(block.unode.unTime, "min"),
+			prefix + block.unode.unType + "_day_" + getTime(block.unode.unTime, "day"),
+			prefix + block.unode.unType + "_hour_" + getTime(block.unode.unTime, "hour"),
+			prefix + block.unode.unType + "_min_" + getTime(block.unode.unTime, "min"),
+		}
+
+		rowId := block.unode.unRid
+		for _, key := range setKeys {
+			ret, err := redisPool.Cmd(block.storageModel, key, 1, rowId).Int()
+			if ret <= 0 || err != nil {
+				log.Errorln("DataStorage redis storage error.", block.storageModel, key, rowId)
+			} else {
+
+			}
+		}
+	}
 }
 
+//一天访问多少次
 func pvCounter(pvChannel chan urlData, storageChannel chan storageBlock) {
-
+	for data := range pvChannel {
+		sItem := storageBlock{
+			counterType:  "pv",
+			storageModel: "ZINCRBY",
+			unode:        data.unode,
+		}
+		storageChannel <- sItem
+	}
 }
 
-func uvCounter(uvChannel chan urlData, storageChannel chan storageBlock) {
+//一天访问有多少人 需要做去重处理
+func uvCounter(uvChannel chan urlData, storageChannel chan storageBlock, redisPool *pool.Pool) {
+	for data := range uvChannel {
+		// HyperLoglog redis 来去重
+		hyperLogLogKey := "uv_hpll_" + getTime(data.data.time, "day")
+		ret, err := redisPool.Cmd("PFADD", hyperLogLogKey, data.uid, "EX", 86400).Int()
+		if err != nil {
+			log.Warningln("UvCounter check redis hyperloglog failed ", err)
+		}
+		if ret != 1 {
+			continue
+		}
 
+		// insert success
+		sItem := storageBlock{
+			counterType:  "uv",
+			storageModel: "ZINCRBY",
+			unode:        data.unode,
+		}
+		storageChannel <- sItem
+	}
 }
 
 func logConsumer(logChannel chan string, pvChannel chan urlData, uvChannel chan urlData) error {
@@ -121,10 +211,11 @@ func logConsumer(logChannel chan string, pvChannel chan urlData, uvChannel chan 
 
 		//很多解析的工作都可以放到这里去完成 因为这里的实例比较简单
 		uData := urlData{
-			data: data,
-			uid:  uid,
+			data:  data,
+			uid:   uid,
+			unode: formatUrl(data.url, data.time),
 		}
-		log.Infoln(uData)
+		// log.Infoln(uData)
 		pvChannel <- uData
 		uvChannel <- uData
 	}
@@ -184,4 +275,45 @@ func readFileLinebyLine(params cmdParams, logChannel chan string) error {
 		}
 	}
 	return nil
+}
+
+func formatUrl(url, t string) urlNode {
+	// 一定从量大的着手, 详情页>列表页>首页
+	pos1 := str.IndexOf(url, HANDLE_MOVIE, 0)
+	if pos1 != -1 {
+		// 详情页
+		pos1 += len(HANDLE_MOVIE)
+		pos2 := str.IndexOf(url, HANDLE_HTML, 0)
+		idStr := str.Substr(url, pos1, pos2-pos1)
+		id, _ := strconv.Atoi(idStr)
+		return urlNode{unType: "movie", unRid: id, unUrl: url, unTime: t}
+	} else {
+		// 列表页
+		pos1 = str.IndexOf(url, HANDLE_LIST, 0)
+		if pos1 != -1 {
+			pos1 += len(HANDLE_MOVIE)
+			pos2 := str.IndexOf(url, HANDLE_HTML, 0)
+			idStr := str.Substr(url, pos1, pos2-pos1)
+			id, _ := strconv.Atoi(idStr)
+			return urlNode{unType: "list", unRid: id, unTime: t}
+		} else {
+			// 首页
+			return urlNode{unType: "home", unRid: 1, unUrl: url, unTime: t}
+		}
+	}
+	//如果页面url有很多种 就在这里扩展
+}
+
+func getTime(logTime, timeType string) string {
+	var item string
+	switch timeType {
+	case "day":
+		item = "2006-01-02"
+	case "hour":
+		item = "2006-01-02 15"
+	case "min":
+		item = "2006-01-02 15:04"
+	}
+	t, _ := time.Parse(item, time.Now().Format(item))
+	return strconv.FormatInt(t.Unix(), 10)
 }
